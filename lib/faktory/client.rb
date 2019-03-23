@@ -63,6 +63,10 @@ module Faktory
           returning *
       })
 
+      @db.prepare("push_job", %Q{
+        insert into jobs (jobtype, queue, args) values ($1, $2, $3) returning *
+      })
+
       open(@timeout)
     end
 
@@ -80,11 +84,9 @@ module Faktory
     end
 
     def push(job)
-      transaction do
-        command "PUSH", JSON.generate(job)
-        ok!
-        job["jid"]
-      end
+      new_job = db.exec_prepared("push_job", job.slice('jobtype', 'queue', 'args').values)
+      debug "> #{new_job[0]}" if @debug
+      new_job[0]['jid'].to_s
     end
 
     def fetch(*queues)
@@ -138,11 +140,12 @@ module Faktory
     end
 
     def open(timeout = DEFAULT_TIMEOUT)
+      labels = PG::TextEncoder::Array.new.encode(Faktory.options[:labels] || ["ruby-#{RUBY_VERSION}"]).force_encoding('utf-8')
       worker = @db.exec_prepared("create_worker", [
         Socket.gethostname, 
         $$, 
         '1.0', 
-        Faktory.options[:labels] || ["ruby-#{RUBY_VERSION}"], 
+        labels, 
         Time.now, 
         Time.now]
       )[0]
