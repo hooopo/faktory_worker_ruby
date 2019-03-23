@@ -11,28 +11,21 @@ module Faktory
   class ParseError < StandardError;end
 
   class Client
-    @@random_process_wid = ""
+    @worker_id = 0
 
     DEFAULT_TIMEOUT = 5.0
-
-    HASHER = proc do |iter, pwd, salt|
-      sha = Digest::SHA256.new
-      hashing = pwd + salt
-      iter.times do
-        hashing = sha.digest(hashing)
-      end
-      Digest.hexencode(hashing)
-    end
-
 
     # Called when booting the worker process to signal that this process
     # will consume jobs and send BEAT.
     def self.worker!
-      @@random_process_wid = SecureRandom.hex(8)
+      @worker_id = Faktory.server {|c| c.create_worker }
+    end
+
+    class << self
+      attr_reader :worker_id
     end
 
     attr_accessor :middleware
-    attr_reader :worker_id
     attr_reader :db
 
     # Best practice is to rely on the localhost default for development
@@ -42,10 +35,9 @@ module Faktory
     # MY_PGMQ_URL=postgres://:somepass@my-server.example.com:5432
     #
     # Note above, the URL can contain the password for secure installations.
-    def initialize(url: uri_from_env || 'postgres://localhost:5432', debug: true, timeout: DEFAULT_TIMEOUT)
+    def initialize(url: uri_from_env || 'postgres://localhost:5432', debug: true)
       @debug = debug
       @location = URI(url)
-      @timeout = timeout
       @db = PG.connect(ENV['PGMQ_URL'])
       @db.exec 'set search_path to pgmq'
       mini_sql = MiniSql::Connection.get(@db)
@@ -67,7 +59,40 @@ module Faktory
         insert into jobs (jobtype, queue, args) values ($1, $2, $3) returning *
       })
 
-      open(@timeout)
+      @db.prepare("beat", %Q{
+        update workers set last_active_at = $1 where id = $2
+      })
+
+      @db.prepare("fetch_jobs", %Q{
+        UPDATE ONLY jobs 
+           SET state = 'working', enqueued_at = now()
+         WHERE jid IN (
+                      SELECT jid
+                        FROM  ONLY jobs
+                       WHERE state = 'scheduled' AND at <= now() AND queue = ANY ($1)
+                    ORDER BY at DESC, priority DESC
+                             FOR UPDATE SKIP LOCKED
+                       LIMIT $2
+          )
+        RETURNING *
+      })
+
+      @db.prepare("complete_jobs", %Q{
+        UPDATE ONLY jobs
+           SET state = 'done',
+               completed_at = now(),
+               worker_id = $1
+         WHERE jid = $2
+      })
+
+      @db.prepare("reset_jobs", %Q{
+        UPDATE ONLY jobs 
+           SET state = 'scheduled',
+               retry = retry - 1,
+               worker_id = $2,
+               failure = $3
+         WHERE jid = $1
+      })
     end
 
     def close
@@ -90,29 +115,23 @@ module Faktory
     end
 
     def fetch(*queues)
+      debug "> fetch #{queues.join('/')}" if @debug
       job = nil
-      transaction do
-        command("FETCH", *queues)
-        job = result
-      end
-      JSON.parse(job) if job
+      job = db.exec_prepared('fetch_jobs', [to_pg_array(queues), 1])[0]
+      job if not job.empty?
     end
 
     def ack(jid)
-      transaction do
-        command("ACK", %Q[{"jid":"#{jid}"}])
-        ok!
-      end
+      db.exec_prepared("complete_jobs", [Client.worker_id, jid])
     end
 
     def fail(jid, ex)
-      transaction do
-        command("FAIL", JSON.dump({ message: ex.message[0...1000],
-                          errtype: ex.class.name,
-                          jid: jid,
-                          backtrace: ex.backtrace}))
-        ok!
-      end
+      db.exec_prepared("reset_jobs", [jid, Client.worker_id, JSON.dump({
+          errtype: ex.class.name,
+          message: ex.message[0...1000],
+          backtrace: ex.backtrace[0...1000]
+        })]
+      )
     end
 
     # Sends a heartbeat to the server, in order to prove this
@@ -122,6 +141,8 @@ module Faktory
     # The quiet signal is informative: the server won't allow this process to FETCH
     # any more jobs anyways.
     def beat
+      db.exec_prepared("beat", [Time.now, Client.worker_id])
+      debug "> beat" if @debug
       "OK"
     end
 
@@ -133,14 +154,8 @@ module Faktory
       end
     end
 
-    private
-
-    def debug(line)
-      puts line
-    end
-
-    def open(timeout = DEFAULT_TIMEOUT)
-      labels = PG::TextEncoder::Array.new.encode(Faktory.options[:labels] || ["ruby-#{RUBY_VERSION}"]).force_encoding('utf-8')
+    def create_worker
+      labels = to_pg_array(Faktory.options[:labels] || ["ruby-#{RUBY_VERSION}"])
       worker = @db.exec_prepared("create_worker", [
         Socket.gethostname, 
         $$, 
@@ -150,66 +165,17 @@ module Faktory
         Time.now]
       )[0]
 
-      @worker_id = worker['id']
-      @db
+      worker['id']
     end
 
-    def command(*args)
-      cmd = args.join(" ")
-      @sock.puts(cmd)
-      debug "> #{cmd}" if @debug
+    private
+
+    def debug(line)
+      puts line
     end
 
-    def transaction
-      retryable = true
-
-      # When using Faktory::Testing, you can get a client which does not actually
-      # have an underlying socket.  Now if you disable testing and try to use that
-      # client, it will crash without a socket.  This open() handles that case to
-      # transparently open a socket.
-      open(@timeout) if !@sock
-
-      begin
-        yield
-      rescue Errno::EPIPE, Errno::ECONNRESET
-        if retryable
-          retryable = false
-          open(@timeout)
-          retry
-        else
-          raise
-        end
-      end
-    end
-
-    # I love pragmatic, simple protocols.  Thanks antirez!
-    # https://redis.io/topics/protocol
-    def result
-      line = @sock.gets
-      debug "< #{line}" if @debug
-      raise Errno::ECONNRESET, "No response" unless line
-      chr = line[0]
-      if chr == '+'
-        line[1..-1].strip
-      elsif chr == '$'
-        count = line[1..-1].strip.to_i
-        return nil if count == -1
-        data = @sock.read(count) if count > 0
-        line = @sock.gets # read extra linefeeds
-        data
-      elsif chr == '-'
-        raise CommandError, line[1..-1]
-      else
-        # this is bad, indicates we need to reset the socket
-        # and start fresh
-        raise ParseError, line.strip
-      end
-    end
-
-    def ok!
-      resp = result
-      raise CommandError, resp if resp != "OK"
-      true
+    def to_pg_array(array)
+      PG::TextEncoder::Array.new.encode(array).force_encoding('utf-8')
     end
 
     # PGMQ_PROVIDER=MY_PGMQ_URL

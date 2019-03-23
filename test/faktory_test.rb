@@ -13,12 +13,4 @@ class TestFaktory < Minitest::Test
     assert_equal expected, io.string
   end
 
-  def test_password_hashing
-    iter = 1545
-    pwd = "foobar"
-    salt = "55104dc76695721d"
-    result = Faktory::Client::HASHER.(iter, pwd, salt)
-    assert_equal "6d877f8e5544b1f2598768f817413ab8a357afffa924dedae99eb91472d4ec30", result
-  end
-
 end
