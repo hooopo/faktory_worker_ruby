@@ -69,7 +69,7 @@ module Faktory
          WHERE jid IN (
                       SELECT jid
                         FROM  ONLY jobs
-                       WHERE state = 'scheduled' AND at <= now() AND queue = ANY ($1)
+                       WHERE state = 'scheduled' AND at <= now() AND queue = ANY ($1) AND retry > 0
                     ORDER BY at DESC, priority DESC
                              FOR UPDATE SKIP LOCKED
                        LIMIT $2
@@ -87,10 +87,10 @@ module Faktory
 
       @db.prepare("reset_jobs", %Q{
         UPDATE ONLY jobs 
-           SET state = 'scheduled',
+           SET state = $2,
                retry = retry - 1,
-               worker_id = $2,
-               failure = $3
+               worker_id = $3,
+               failure = $4
          WHERE jid = $1
       })
     end
@@ -125,8 +125,13 @@ module Faktory
       db.exec_prepared("complete_jobs", [Client.worker_id, jid])
     end
 
-    def fail(jid, ex)
-      db.exec_prepared("reset_jobs", [jid, Client.worker_id, JSON.dump({
+    def fail(job, ex)
+      if job['retry'] == 1
+        state = 'dead'
+      else
+        state = 'scheduled'
+      end
+      db.exec_prepared("reset_jobs", [job['jid'], state, Client.worker_id, JSON.dump({
           errtype: ex.class.name,
           message: ex.message[0...1000],
           backtrace: ex.backtrace[0...1000]

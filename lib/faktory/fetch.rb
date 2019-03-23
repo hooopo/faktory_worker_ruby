@@ -7,7 +7,7 @@ module Faktory
     end
 
     def fail(ex)
-      Faktory.server {|c| c.fail(jid, ex) }
+      Faktory.server {|c| c.fail(job, ex) }
     end
 
     def jid
