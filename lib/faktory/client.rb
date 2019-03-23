@@ -3,6 +3,8 @@ require 'json'
 require 'uri'
 require 'digest'
 require 'securerandom'
+require 'pg'
+require 'mini_sql'
 
 module Faktory
   class CommandError < StandardError;end
@@ -30,27 +32,43 @@ module Faktory
     end
 
     attr_accessor :middleware
+    attr_reader :worker_id
+    attr_reader :db
 
     # Best practice is to rely on the localhost default for development
     # and configure the environment variables for non-development environments.
     #
-    # FAKTORY_PROVIDER=MY_FAKTORY_URL
-    # MY_FAKTORY_URL=tcp://:somepass@my-server.example.com:7419
+    # PGMQ_PROVIDER=MY_FAKTORY_URL
+    # MY_PGMQ_URL=postgres://:somepass@my-server.example.com:5432
     #
     # Note above, the URL can contain the password for secure installations.
-    def initialize(url: uri_from_env || 'tcp://localhost:7419', debug: true, timeout: DEFAULT_TIMEOUT)
+    def initialize(url: uri_from_env || 'postgres://localhost:5432', debug: true, timeout: DEFAULT_TIMEOUT)
       @debug = debug
       @location = URI(url)
       @timeout = timeout
+      @db = PG.connect(ENV['PGMQ_URL'])
+      @db.exec 'set search_path to pgmq'
+      mini_sql = MiniSql::Connection.get(@db)
+      @db.type_map_for_results = mini_sql.type_map
+
+      @db.prepare("create_worker", %Q{
+        insert into workers (hostname, pid, v, labels, started_at, last_active_at)
+             values ($1, $2, $3, $4, $5, $6)
+        on conflict (pid)
+                    do update set last_active_at = EXCLUDED.last_active_at,
+                                  hostname = EXCLUDED.hostname,
+                                  v = EXCLUDED.v,
+                                  labels = EXCLUDED.labels,
+                                  started_at = EXCLUDED.started_at
+          returning *
+      })
 
       open(@timeout)
     end
 
     def close
-      return unless @sock
-      command "END"
-      @sock.close
-      @sock = nil
+      @db
+      @db = nil
     end
 
     # Warning: this clears all job data in Faktory
@@ -102,16 +120,7 @@ module Faktory
     # The quiet signal is informative: the server won't allow this process to FETCH
     # any more jobs anyways.
     def beat
-      transaction do
-        command("BEAT", %Q[{"wid":"#{@@random_process_wid}"}])
-        str = result
-        if str == "OK"
-          str
-        else
-          hash = JSON.parse(str)
-          hash["state"]
-        end
-      end
+      "OK"
     end
 
     def info
@@ -128,70 +137,18 @@ module Faktory
       puts line
     end
 
-    def tls?
-      # Support TLS with this convention: "tcp+tls://:password@myhostname:port/"
-      @location.scheme =~ /tls/
-    end
-
     def open(timeout = DEFAULT_TIMEOUT)
-      # this is the read/write timeout, not open.
-      secs = Integer(timeout)
-      usecs = Integer((timeout - secs) * 1_000_000)
-      optval = [secs, usecs].pack("l_2")
-      if tls?
-        sock = TCPSocket.new(@location.hostname, @location.port)
-        sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_KEEPALIVE, true)
-        sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_RCVTIMEO, optval)
-        sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_SNDTIMEO, optval)
+      worker = @db.exec_prepared("create_worker", [
+        Socket.gethostname, 
+        $$, 
+        '1.0', 
+        Faktory.options[:labels] || ["ruby-#{RUBY_VERSION}"], 
+        Time.now, 
+        Time.now]
+      )[0]
 
-        ctx = OpenSSL::SSL::SSLContext.new
-        ctx.set_params(verify_mode: OpenSSL::SSL::VERIFY_PEER)
-        ctx.ssl_version = :TLSv1_2
-
-        @sock = OpenSSL::SSL::SSLSocket.new(sock, ctx).tap do |socket|
-          socket.sync_close = true
-          socket.connect
-        end
-      else
-        @sock = TCPSocket.new(@location.hostname, @location.port)
-        @sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_KEEPALIVE, true)
-        @sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_RCVTIMEO, optval)
-        @sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_SNDTIMEO, optval)
-      end
-
-      payload = {
-        "wid": @@random_process_wid,
-        "hostname": Socket.gethostname,
-        "pid": $$,
-        "labels": Faktory.options[:labels] || ["ruby-#{RUBY_VERSION}"],
-        "v": 2,
-      }
-
-      hi = result
-
-      if hi =~ /\AHI (.*)/
-        hash = JSON.parse($1)
-        ver = hash["v"].to_i
-        if ver > 2
-          puts "Warning: Faktory server protocol #{ver} in use, this worker doesn't speak that version."
-          puts "We recommend you upgrade this gem with `bundle up faktory_worker_ruby`."
-        end
-
-        salt = hash["s"]
-        if salt
-          pwd = @location.password
-          if !pwd
-            raise ArgumentError, "Server requires password, but none has been configured"
-          end
-          iter = (hash["i"] || 1).to_i
-          raise ArgumentError, "Invalid hashing" if iter < 1
-
-          payload["pwdhash"] = HASHER.(iter, pwd, salt)
-        end
-      end
-
-      command("HELLO", JSON.dump(payload))
-      ok!
+      @worker_id = worker['id']
+      @db
     end
 
     def command(*args)
@@ -252,21 +209,21 @@ module Faktory
       true
     end
 
-    # FAKTORY_PROVIDER=MY_FAKTORY_URL
-    # MY_FAKTORY_URL=tcp://:some-pass@some-hostname:7419
+    # PGMQ_PROVIDER=MY_PGMQ_URL
+    # MY_PGMQ_URL=postgres://:some-pass@some-hostname:5432
     def uri_from_env
-      prov = ENV['FAKTORY_PROVIDER']
+      prov = ENV['PGMQ_PROVIDER']
       if prov
         raise(ArgumentError, <<-EOM) if prov.index(":")
-  Invalid FAKTORY_PROVIDER '#{prov}', it should be the name of the ENV variable that contains the URL
-      FAKTORY_PROVIDER=MY_FAKTORY_URL
-      MY_FAKTORY_URL=tcp://:some-pass@some-hostname:7419
+  Invalid PGMQ_PROVIDER '#{prov}', it should be the name of the ENV variable that contains the URL
+      PGMQ_PROVIDER=MY_PGMQ_URL
+      MY_PGMQ_URL=tcp://:some-pass@some-hostname:5432
   EOM
         val = ENV[prov]
         return URI(val) if val
       end
 
-      val = ENV['FAKTORY_URL']
+      val = ENV['PGMQ_URL']
       return URI(val) if val
       nil
     end

@@ -17,6 +17,8 @@ Gem::Specification.new do |gem|
   gem.required_ruby_version = ">= 2.3.0"
 
   gem.add_dependency                  'connection_pool', '~> 2.2', ">= 2.2.1"
+  gem.add_dependency                  'pg'
+  gem.add_dependency                  'mini_sql'
   gem.add_development_dependency      'activejob', '>= 5.1.5'
   gem.add_development_dependency      'minitest', '~> 5'
   gem.add_development_dependency      'minitest-hooks'
