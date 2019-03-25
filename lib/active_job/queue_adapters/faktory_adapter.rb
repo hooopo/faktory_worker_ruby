@@ -15,7 +15,7 @@ module ActiveJob
       end
 
       def enqueue_at(job, timestamp) #:nodoc:
-        jid = SecureRandom.hex(12)
+        jid = SecureRandom.uuid
         job.provider_job_id = jid
         hash = {
           "jid"     => jid,

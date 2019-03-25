@@ -109,7 +109,7 @@ module Faktory
         item.keys.each do |key|
           item[key.to_s] = item.delete(key)
         end
-        item["jid"] ||= SecureRandom.hex(12)
+        item["jid"] ||= SecureRandom.uuid
         item["queue"] ||= "default"
 
         Faktory.client_middleware.invoke(item, pool) do

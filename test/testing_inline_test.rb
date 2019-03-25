@@ -41,7 +41,7 @@ class TestingInlineTest < LiveTest
       Faktory::Testing.inline! do
         client = Faktory::Client.new
         assert client.push({
-          "jid" => SecureRandom.hex(12),
+          "jid" => SecureRandom.uuid,
           "queue" => "default",
           "jobtype" => InlineJob,
           "args" => [true]
@@ -49,7 +49,7 @@ class TestingInlineTest < LiveTest
 
         assert_raises InlineError do
           client.push({
-            "jid" => SecureRandom.hex(12),
+            "jid" => SecureRandom.uuid,
             "queue" => "default",
             "jobtype" => InlineJob,
             "args" => [false]

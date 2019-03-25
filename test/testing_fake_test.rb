@@ -53,7 +53,7 @@ class TestingFakeTest < LiveTest
     it 'stubs the push call' do
       assert_equal 0, EnqueuedJob.jobs.size
       assert Faktory::Client.new.push({
-        "jid" => SecureRandom.hex(12),
+        "jid" => SecureRandom.uuid,
         "queue" => "default",
         "jobtype" => EnqueuedJob,
         "args" => [1,2]
