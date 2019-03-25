@@ -117,8 +117,11 @@ module Faktory
     def fetch(*queues)
       debug "> fetch #{queues.join('/')}" if @debug
       job = nil
-      job = db.exec_prepared('fetch_jobs', [to_pg_array(queues), 1])[0]
-      job if not job.empty?
+      result = db.exec_prepared('fetch_jobs', [to_pg_array(queues), 1])
+      if result.cmd_status != "UPDATE 0"
+        job = result[0]
+      end
+      job
     end
 
     def ack(jid)
